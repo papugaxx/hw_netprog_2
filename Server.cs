@@ -1,122 +1,116 @@
-﻿using System.Net;
+using System;
+using System.Collections.Generic;
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.IO;
 
-class Program
+public class ClientInfo
 {
-    static readonly Dictionary<(string, string), double> Rates = new()
-    {
-        {("USD","EUR"), 0.92}, {("EUR","USD"), 1.08},
-        {("USD","UAH"), 41.0}, {("UAH","USD"), 0.024}
-    };
+    public DateTime ConnectionTime { get; set; } = DateTime.Now;
+    public DateTime LastActivityTime { get; set; } = DateTime.Now;
+    public List<DateTime> RequestTimes { get; set; } = new List<DateTime>();
+}
 
-    static readonly int MaxRequestsPerSession = 3;
-    static readonly int MaxClients = 2; 
-
-    static readonly Dictionary<string, DateTime> BannedClients = new();
-    static int CurrentClients = 0;
+class ServerUDP
+{
+    static UdpClient server;
+    static Dictionary<IPEndPoint, ClientInfo> clients = new Dictionary<IPEndPoint, ClientInfo>();
+    static Dictionary<string, decimal> prices = new Dictionary<string, decimal>();
+    static object locker = new object();
+    static string logFile = "server_log.txt";
 
     static void Main()
     {
-        var listener = new TcpListener(IPAddress.Any, 5000);
-        listener.Start();
-        Console.WriteLine(
-            $"Сервер запущен... Лимит запросов: {MaxRequestsPerSession}, Макс клиентов: {MaxClients}");
+        Console.Title = "Комплектующие";
+        server = new UdpClient(8888);
+
+        prices["processor"] = 250;
+        prices["videocard"] = 499;
+        prices["ram"] = 120;
+        prices["ssd"] = 89;
+        prices["motherboard"] = 180;
+
+        Thread cleaner = new Thread(RemoveInactiveClients);
+        cleaner.Start();
+
+        Console.WriteLine("Сервер запущен на порту 8888 ");
 
         while (true)
         {
-            var client = listener.AcceptTcpClient();
+            IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+            byte[] data = server.Receive(ref remoteEP);
+            string request = Encoding.UTF8.GetString(data);
 
-            if (Interlocked.CompareExchange(ref CurrentClients, 0, 0) >= MaxClients)
+            lock (locker)
             {
-                using var stream = client.GetStream();
-                using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-                writer.WriteLine("Сервер перегружен. Попробуйте подключиться позже.");
-                Log("Отклонено подключение: сервер достиг лимита клиентов.");
-                client.Close();
-                continue;
-            }
-
-            Interlocked.Increment(ref CurrentClients);
-            _ = Task.Run(() => HandleClient(client));
-        }
-    }
-
-    static void HandleClient(TcpClient client)
-    {
-        string clientInfo = client.Client.RemoteEndPoint?.ToString() ?? "неизвестно";
-        Log($"Подключение: {clientInfo}");
-
-        try
-        {
-            using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-
-            writer.WriteLine("Введите: USD EUR или QUIT");
-
-            int requestCount = 0;
-
-            string? line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                if (BannedClients.TryGetValue(clientInfo, out var until))
+                if (!clients.ContainsKey(remoteEP))
                 {
-                    if (DateTime.Now < until)
-                    {
-                        var remaining = (int)(until - DateTime.Now).TotalSeconds;
-                        writer.WriteLine($"Вы заблокированы. Подождите {remaining} секунд.");
-                        continue; 
-                    }
-                    else
-                    {
-                        BannedClients.Remove(clientInfo);
-                        requestCount = 0;
-                    }
+                    clients[remoteEP] = new ClientInfo();
+                    Log($"Новый клиент {remoteEP}");
                 }
 
-                if (line.ToUpper() == "QUIT") break;
+                clients[remoteEP].LastActivityTime = DateTime.Now;
 
-                requestCount++;
-                if (requestCount > MaxRequestsPerSession)
+                clients[remoteEP].RequestTimes.RemoveAll(t => (DateTime.Now - t).TotalHours > 1);
+                if (clients[remoteEP].RequestTimes.Count >= 10)
                 {
-                    var banUntil = DateTime.Now.AddMinutes(1);
-                    BannedClients[clientInfo] = banUntil;
-                    writer.WriteLine("Вы превысили лимит запросов. Заблокированы на 60 секунд.");
-                    Log($"Блокировка клиента {clientInfo} до {banUntil}");
+                    Send("Лимит 10 запросов в час превышен!", remoteEP);
+                    Log($"Клиент {remoteEP} превысил лимит запросов");
                     continue;
                 }
 
-                var parts = line.Split(' ');
-                if (parts.Length == 2 &&
-                    Rates.TryGetValue((parts[0].ToUpper(), parts[1].ToUpper()), out var rate))
-                {
-                    string response = $"{parts[0].ToUpper()} -> {parts[1].ToUpper()} = {rate}";
-                    writer.WriteLine(response);
-                    Log($"Запрос {clientInfo}: {response}");
-                }
-                else
-                {
-                    writer.WriteLine("Нет данных для этой пары.");
-                }
+                clients[remoteEP].RequestTimes.Add(DateTime.Now);
             }
-        }
-        catch (Exception ex)
-        {
-            Log($"Ошибка клиента {clientInfo}: {ex.Message}");
-        }
-        finally
-        {
-            client.Close();
-            Interlocked.Decrement(ref CurrentClients);
-            Log($"Отключение: {clientInfo}. Текущих клиентов: {CurrentClients}");
+
+            string response = HandleRequest(request);
+            Send(response, remoteEP);
+            Log($"Запрос от {remoteEP}: \"{request}\" → Ответ: \"{response}\"");
         }
     }
 
-    static void Log(string msg)
+    static string HandleRequest(string request)
     {
-        string line = $"[{DateTime.Now}] {msg}";
+        string key = request.Trim().ToLower();
+        if (prices.ContainsKey(key))
+            return $"Цена на {key}: {prices[key]} $";
+        else
+            return $"Товар \"{request}\" не найден.";
+    }
+
+    static void Send(string message, IPEndPoint client)
+    {
+        byte[] data = Encoding.UTF8.GetBytes(message);
+        server.Send(data, data.Length, client);
+    }
+
+    static void RemoveInactiveClients()
+    {
+        while (true)
+        {
+            Thread.Sleep(60000); 
+            lock (locker)
+            {
+                var toRemove = new List<IPEndPoint>();
+                foreach (var c in clients)
+                {
+                    if ((DateTime.Now - c.Value.LastActivityTime).TotalMinutes > 10)
+                        toRemove.Add(c.Key);
+                }
+                foreach (var r in toRemove)
+                {
+                    clients.Remove(r);
+                    Log($"Клиент {r} отключен за неактивность");
+                }
+            }
+        }
+    }
+
+    static void Log(string text)
+    {
+        string line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | {text}";
         Console.WriteLine(line);
+        File.AppendAllText(logFile, line + Environment.NewLine);
     }
 }
