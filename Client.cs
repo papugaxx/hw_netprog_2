@@ -1,27 +1,38 @@
-﻿using System.Net.Sockets;
+using System;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
 
-class Program
+class ClientUDP
 {
     static void Main()
     {
-        using var client = new TcpClient("127.0.0.1", 5000);
-        using var stream = client.GetStream();
-        using var reader = new StreamReader(stream, Encoding.UTF8);
-        using var writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+        Console.Title = "Комплектующие";
+        UdpClient client = new UdpClient();
+        client.Connect("127.0.0.1", 8888);
 
-        Console.WriteLine(reader.ReadLine()); 
+        Console.WriteLine("Клиент подключён к серверу.");
+        Console.WriteLine("Введите название комплектующего (processor, videocard, ram, ssd, motherboard)");
+        Console.WriteLine("Для выхода напишите: exit");
 
         while (true)
         {
-            Console.Write("> ");
-            var msg = Console.ReadLine();
-            if (string.IsNullOrWhiteSpace(msg)) continue;
+            Console.Write("\nВаш запрос: ");
+            string message = Console.ReadLine();
 
-            writer.WriteLine(msg);
-            if (msg.ToUpper() == "QUIT") break;
+            if (message.ToLower() == "exit") break;
 
-            Console.WriteLine("Сервер: " + reader.ReadLine());
+            byte[] data = Encoding.UTF8.GetBytes(message);
+            client.Send(data, data.Length);
+
+            IPEndPoint remoteEP = null;
+            byte[] received = client.Receive(ref remoteEP);
+            string response = Encoding.UTF8.GetString(received);
+            Console.WriteLine($"Ответ от сервера: {response}");
         }
+
+        client.Close();
+        Console.WriteLine("Клиент отключён.");
     }
 }
+
